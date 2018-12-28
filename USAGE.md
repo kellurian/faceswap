@@ -43,7 +43,7 @@ python faceswap.py train -A ~/faceswap/data/trump -B ~/faceswap/data/cage -m ~/f
 python faceswap.py train -A ~/faceswap/data/trump -B ~/faceswap/data/cage -m ~/faceswap/models/ -p 
 ```
 
-If you use the preview feature, select the preview window and press Q to save your processed data and quit gracefully. Without the preview enabled, you might have to forcefully quit by hitting Ctrl+C to cancel the command. Note that it will save the model once it's gone through about 100 iterations, which can take quite a while. So make sure you save before stopping the process.
+If you use the preview feature, select the preview window and press ENTER to save your processed data and quit gracefully. Without the preview enabled, you might have to forcefully quit by hitting Ctrl+C to cancel the command. Note that it will save the model once it's gone through about 100 iterations, which can take quite a while. So make sure you save before stopping the process.
 
 You can see the full list of arguments for training via help flag. i.e.
 
@@ -68,11 +68,25 @@ You can see the full list of arguments available for converting via help flag. i
 python faceswap.py convert -h
 ```
 
+## GUI
+All of the above commands and options can be run from the GUI. This is launched with:
+```bash
+python faceswap.py gui
+```
+
+
+
 ## Video's
 A video is just a series of pictures in the form of frames. Therefore you can gather the raw images from them for your dataset or combine your results into a video.
 
-## Extracting video frames
-You can split a video into seperate frames using [ffmpeg](https://www.ffmpeg.org) for instance. Below is an example command to process a video to seperate frames.
+## EFFMPEG
+You can perform various video processes with the built in effmpeg tool. You can see the full list of arguments available by running:
+```bash
+python tools.py effmpeg -h
+```
+
+## Extracting video frames with FFMPEG
+Alternatively you can split a video into seperate frames using [ffmpeg](https://www.ffmpeg.org) for instance. Below is an example command to process a video to seperate frames.
 
 ```bash
 ffmpeg -i /path/to/my/video.mp4 /path/to/output/video-frame-%d.png

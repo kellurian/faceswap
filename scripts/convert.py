@@ -1,264 +1,381 @@
-import cv2
+#!/usr/bin python3
+""" The script to run the convert process of faceswap """
+
+import logging
 import re
 import os
-
+import sys
 from pathlib import Path
+
+import cv2
 from tqdm import tqdm
 
-from lib.cli import DirectoryProcessor, FullPaths
-from lib.utils import BackgroundGenerator, get_folder, get_image_paths, rotate_image
+from scripts.fsmedia import Alignments, Images, PostProcess, Utils
+from lib.faces_detect import DetectedFace
+from lib.multithreading import BackgroundGenerator, SpawnProcess
+from lib.queue_manager import queue_manager
+from lib.utils import get_folder, get_image_paths, hash_image_file
 
-from plugins.PluginLoader import PluginLoader
+from plugins.plugin_loader import PluginLoader
 
-class ConvertImage(DirectoryProcessor):
-    filename = ''
-    def create_parser(self, subparser, command, description):
-        self.parser = subparser.add_parser(
-            command,
-            help="Convert a source image to a new one with the face swapped.",
-            description=description,
-            epilog="Questions and feedback: \
-            https://github.com/deepfakes/faceswap-playground"
-        )
-
-    def add_optional_arguments(self, parser):
-        parser.add_argument('-m', '--model-dir',
-                            action=FullPaths,
-                            dest="model_dir",
-                            default="models",
-                            help="Model directory. A directory containing the trained model \
-                            you wish to process. Defaults to 'models'")
-
-        parser.add_argument('-a', '--input-aligned-dir',
-                            action=FullPaths,
-                            dest="input_aligned_dir",
-                            default=None,
-                            help="Input \"aligned directory\". A directory that should contain the \
-                            aligned faces extracted from the input files. If you delete faces from \
-                            this folder, they'll be skipped during conversion. If no aligned dir is \
-                            specified, all faces will be converted.")
-
-        parser.add_argument('-t', '--trainer',
-                            type=str,
-                            choices=PluginLoader.get_available_models(), # case sensitive because this is used to load a plug-in.
-                            default=PluginLoader.get_default_model(),
-                            help="Select the trainer that was used to create the model.")
-
-        parser.add_argument('-s', '--swap-model',
-                            action="store_true",
-                            dest="swap_model",
-                            default=False,
-                            help="Swap the model. Instead of A -> B, swap B -> A.")
-
-        parser.add_argument('-c', '--converter',
-                            type=str,
-                            choices=("Masked", "Adjust"), # case sensitive because this is used to load a plugin.
-                            default="Masked",
-                            help="Converter to use.")
-
-        parser.add_argument('-D', '--detector',
-                            type=str,
-                            choices=("hog", "cnn"), # case sensitive because this is used to load a plugin.
-                            default="hog",
-                            help="Detector to use. 'cnn' detects much more angles but will be much more resource intensive and may fail on large files.")
-
-        parser.add_argument('-fr', '--frame-ranges',
-                            nargs="+",
-                            type=str,
-                            help="frame ranges to apply transfer to e.g. For frames 10 to 50 and 90 to 100 use --frame-ranges 10-50 90-100. \
-                            Files must have the frame-number as the last number in the name!"
-                            )
-
-        parser.add_argument('-d', '--discard-frames',
-                            action="store_true",
-                            dest="discard_frames",
-                            default=False,
-                            help="When used with --frame-ranges discards frames that are not processed instead of writing them out unchanged."
-                            )
-
-        parser.add_argument('-l', '--ref_threshold',
-                            type=float,
-                            dest="ref_threshold",
-                            default=0.6,
-                            help="Threshold for positive face recognition"
-                            )
-
-        parser.add_argument('-n', '--nfilter',
-                            type=str,
-                            dest="nfilter",
-                            nargs='+',
-                            default="nfilter.jpg",
-                            help="Reference image for the persons you do not want to process. Should be a front portrait"
-                            )
-
-        parser.add_argument('-f', '--filter',
-                            type=str,
-                            dest="filter",
-                            nargs="+",
-                            default="filter.jpg",
-                            help="Reference images for the person you want to process. Should be a front portrait"
-                            )
-
-        parser.add_argument('-b', '--blur-size',
-                            type=int,
-                            default=2,
-                            help="Blur size. (Masked converter only)")
+logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
 
 
-        parser.add_argument('-S', '--seamless',
-                            action="store_true",
-                            dest="seamless_clone",
-                            default=False,
-                            help="Use cv2's seamless clone. (Masked converter only)")
+class Convert():
+    """ The convert process. """
+    def __init__(self, arguments):
+        logger.debug("Initializing %s: (args: %s)", self.__class__.__name__, arguments)
+        self.args = arguments
+        self.output_dir = get_folder(self.args.output_dir)
+        self.extract_faces = False
+        self.faces_count = 0
 
-        parser.add_argument('-M', '--mask-type',
-                            type=str.lower, #lowercase this, because its just a string later on.
-                            dest="mask_type",
-                            choices=["rect", "facehull", "facehullandrect"],
-                            default="facehullandrect",
-                            help="Mask to use to replace faces. (Masked converter only)")
+        self.images = Images(self.args)
+        self.alignments = Alignments(self.args, False)
 
-        parser.add_argument('-e', '--erosion-kernel-size',
-                            dest="erosion_kernel_size",
-                            type=int,
-                            default=None,
-                            help="Erosion kernel size. (Masked converter only). Positive values apply erosion which reduces the edge of the swapped face. Negative values apply dilation which allows the swapped face to cover more space.")
+        # Update Legacy alignments
+        Legacy(self.alignments, self.images.input_images, arguments.input_aligned_dir)
 
-        parser.add_argument('-mh', '--match-histgoram',
-                            action="store_true",
-                            dest="match_histogram",
-                            default=False,
-                            help="Use histogram matching. (Masked converter only)")
+        self.post_process = PostProcess(arguments)
+        self.verify_output = False
 
-        parser.add_argument('-sm', '--smooth-mask',
-                            action="store_true",
-                            dest="smooth_mask",
-                            default=True,
-                            help="Smooth mask (Adjust converter only)")
-
-        parser.add_argument('-aca', '--avg-color-adjust',
-                            action="store_true",
-                            dest="avg_color_adjust",
-                            default=True,
-                            help="Average color adjust. (Adjust converter only)")
-
-        parser.add_argument('-g', '--gpus',
-                            type=int,
-                            default=1,
-                            help="Number of GPUs to use for conversion")
-
-        return parser
+        self.opts = OptionalActions(self.args, self.images.input_images, self.alignments)
+        logger.debug("Initialized %s", self.__class__.__name__)
 
     def process(self):
-        # Original & LowMem models go with Adjust or Masked converter
-        # Note: GAN prediction outputs a mask + an image, while other predicts only an image
-        model_name = self.arguments.trainer
-        conv_name = self.arguments.converter
-        self.input_aligned_dir = None
+        """ Original & LowMem models go with Adjust or Masked converter
 
-        model = PluginLoader.get_model(model_name)(get_folder(self.arguments.model_dir), self.arguments.gpus)
-        if not model.load(self.arguments.swap_model):
-            print('Model Not Found! A valid model must be provided to continue!')
-            exit(1)
+            Note: GAN prediction outputs a mask + an image, while other
+            predicts only an image. """
+        Utils.set_verbosity()
 
-        input_aligned_dir = Path(self.arguments.input_dir)/Path('aligned')
-        if self.arguments.input_aligned_dir is not None:
-            input_aligned_dir = self.arguments.input_aligned_dir
-        try:
-            self.input_aligned_dir = [Path(path) for path in get_image_paths(input_aligned_dir)]
-            if len(self.input_aligned_dir) == 0:
-                print('Aligned directory is empty, no faces will be converted!')
-            elif len(self.input_aligned_dir) <= len(self.input_dir)/3:
-                print('Aligned directory contains an amount of images much less than the input, are you sure this is the right directory?')
-        except:
-            print('Aligned directory not found. All faces listed in the alignments file will be converted.')
+        if not self.alignments.have_alignments_file:
+            self.load_extractor()
 
-        converter = PluginLoader.get_converter(conv_name)(model.converter(False),
-            trainer=self.arguments.trainer,
-            blur_size=self.arguments.blur_size,
-            seamless_clone=self.arguments.seamless_clone,
-            mask_type=self.arguments.mask_type,
-            erosion_kernel_size=self.arguments.erosion_kernel_size,
-            match_histogram=self.arguments.match_histogram,
-            smooth_mask=self.arguments.smooth_mask,
-            avg_color_adjust=self.arguments.avg_color_adjust
-        )
+        model = self.load_model()
+        converter = self.load_converter(model)
 
         batch = BackgroundGenerator(self.prepare_images(), 1)
-
-        # frame ranges stuff...
-        self.frame_ranges = None
-
-        # split out the frame ranges and parse out "min" and "max" values
-        minmax = {
-            "min": 0, # never any frames less than 0
-            "max": float("inf")
-        }
-
-        if self.arguments.frame_ranges:
-            self.frame_ranges = [tuple(map(lambda q: minmax[q] if q in minmax.keys() else int(q), v.split("-"))) for v in self.arguments.frame_ranges]
-
-        # last number regex. I know regex is hacky, but its reliablyhacky(tm).
-        self.imageidxre = re.compile(r'(\d+)(?!.*\d)')
 
         for item in batch.iterator():
             self.convert(converter, item)
 
-    def check_skipframe(self, filename):
-        try:
-            idx = int(self.imageidxre.findall(filename)[0])
-            return not any(map(lambda b: b[0]<=idx<=b[1], self.frame_ranges))
-        except:
-            return False
+        if self.extract_faces:
+            queue_manager.terminate_queues()
 
-    def check_skipface(self, filename, face_idx):
-        aligned_face_name = '{}_{}{}'.format(Path(filename).stem, face_idx, Path(filename).suffix)
-        aligned_face_file = Path(self.arguments.input_aligned_dir) / Path(aligned_face_name)
-        # TODO: Remove this temporary fix for backwards compatibility of filenames
-        bk_compat_aligned_face_name = '{}{}{}'.format(Path(filename).stem, face_idx, Path(filename).suffix)
-        bk_compat_aligned_face_file = Path(self.arguments.input_aligned_dir) / Path(bk_compat_aligned_face_name)
-        return aligned_face_file not in self.input_aligned_dir and bk_compat_aligned_face_file not in self.input_aligned_dir
+        Utils.finalize(self.images.images_found,
+                       self.faces_count,
+                       self.verify_output)
 
-    def convert(self, converter, item):
-        try:
-            (filename, image, faces) = item
+    def load_extractor(self):
+        """ Set on the fly extraction """
+        logger.warning("No Alignments file found. Extracting on the fly.")
+        logger.warning("NB: This will use the inferior dlib-hog for extraction "
+                       "and dlib pose predictor for landmarks. It is recommended "
+                       "to perfom Extract first for superior results")
+        for task in ("load", "detect", "align"):
+            queue_manager.add_queue(task, maxsize=0)
 
-            skip = self.check_skipframe(filename)
-            if self.arguments.discard_frames and skip:
-                return
+        detector = PluginLoader.get_detector("dlib_hog")(loglevel=self.args.loglevel)
+        aligner = PluginLoader.get_aligner("dlib")(loglevel=self.args.loglevel)
 
-            if not skip: # process frame as normal
-                for idx, face in faces:
-                    if self.input_aligned_dir is not None and self.check_skipface(filename, idx):
-                        print ('face {} for frame {} was deleted, skipping'.format(idx, os.path.basename(filename)))
-                        continue
-                    # Check for image rotations and rotate before mapping face
-                    if face.r != 0:
-                        image = rotate_image(image, face.r)
-                        image = converter.patch_image(image, face, 64 if "128" not in self.arguments.trainer else 128)
-                        # TODO: This switch between 64 and 128 is a hack for now. We should have a separate cli option for size
-                        image = rotate_image(image, face.r * -1)
-                    else:
-                        image = converter.patch_image(image, face, 64 if "128" not in self.arguments.trainer else 128)
-                        # TODO: This switch between 64 and 128 is a hack for now. We should have a separate cli option for size
+        d_kwargs = {"in_queue": queue_manager.get_queue("load"),
+                    "out_queue": queue_manager.get_queue("detect")}
+        a_kwargs = {"in_queue": queue_manager.get_queue("detect"),
+                    "out_queue": queue_manager.get_queue("align")}
 
-            output_file = get_folder(self.output_dir) / Path(filename).name
-            cv2.imwrite(str(output_file), image)
-        except Exception as e:
-            print('Failed to convert image: {}. Reason: {}'.format(filename, e))
+        d_process = SpawnProcess(detector.run, **d_kwargs)
+        d_event = d_process.event
+        d_process.start()
+
+        a_process = SpawnProcess(aligner.run, **a_kwargs)
+        a_event = a_process.event
+        a_process.start()
+
+        d_event.wait(10)
+        if not d_event.is_set():
+            raise ValueError("Error inititalizing Detector")
+        a_event.wait(10)
+        if not a_event.is_set():
+            raise ValueError("Error inititalizing Aligner")
+
+        self.extract_faces = True
+
+    def load_model(self):
+        """ Load the model requested for conversion """
+        model_name = self.args.trainer
+        model_dir = get_folder(self.args.model_dir)
+        num_gpus = self.args.gpus
+
+        model = PluginLoader.get_model(model_name)(model_dir, num_gpus)
+
+        if not model.load(self.args.swap_model):
+            logger.error("Model Not Found! A valid model "
+                         "must be provided to continue!")
+            exit(1)
+
+        return model
+
+    def load_converter(self, model):
+        """ Load the requested converter for conversion """
+        args = self.args
+        conv = args.converter
+
+        converter = PluginLoader.get_converter(conv)(
+            model.converter(False),
+            trainer=args.trainer,
+            blur_size=args.blur_size,
+            seamless_clone=args.seamless_clone,
+            sharpen_image=args.sharpen_image,
+            mask_type=args.mask_type,
+            erosion_kernel_size=args.erosion_kernel_size,
+            match_histogram=args.match_histogram,
+            smooth_mask=args.smooth_mask,
+            avg_color_adjust=args.avg_color_adjust,
+            draw_transparent=args.draw_transparent)
+
+        return converter
 
     def prepare_images(self):
-        self.read_alignments()
-        is_have_alignments = self.have_alignments()
-        for filename in tqdm(self.read_directory()):
-            image = cv2.imread(filename)
+        """ Prepare the images for conversion """
+        filename = ""
+        for filename in tqdm(self.images.input_images,
+                             total=self.images.images_found,
+                             file=sys.stdout):
 
-            if is_have_alignments:
-                if self.have_face(filename):
-                    faces = self.get_faces_alignments(filename, image)
-                else:
-                    print ('no alignment found for {}, skipping'.format(os.path.basename(filename)))
-                    continue
+            if (self.args.discard_frames and
+                    self.opts.check_skipframe(filename) == "discard"):
+                continue
+
+            frame = os.path.basename(filename)
+            if self.extract_faces:
+                convert_item = self.detect_faces(filename)
             else:
-                faces = self.get_faces(image)
-            yield filename, image, faces
+                convert_item = self.alignments_faces(filename, frame)
+
+            if not convert_item:
+                continue
+            image, detected_faces = convert_item
+
+            faces_count = len(detected_faces)
+            if faces_count != 0:
+                # Post processing requires a dict with "detected_faces" key
+                self.post_process.do_actions(
+                    {"detected_faces": detected_faces})
+                self.faces_count += faces_count
+
+            if faces_count > 1:
+                self.verify_output = True
+                logger.verbose("Found more than one face in "
+                               "an image! '%s'", frame)
+
+            yield filename, image, detected_faces
+
+    def detect_faces(self, filename):
+        """ Extract the face from a frame (If not alignments file found) """
+        image = self.images.load_one_image(filename)
+        queue_manager.get_queue("load").put((filename, image))
+        item = queue_manager.get_queue("align").get()
+        detected_faces = item["detected_faces"]
+        return image, detected_faces
+
+    def alignments_faces(self, filename, frame):
+        """ Get the face from alignments file """
+        if not self.check_alignments(frame):
+            return None
+
+        faces = self.alignments.get_faces_in_frame(frame)
+        image = self.images.load_one_image(filename)
+        detected_faces = list()
+
+        for rawface in faces:
+            face = DetectedFace()
+            face.from_alignment(rawface, image=image)
+            detected_faces.append(face)
+        return image, detected_faces
+
+    def check_alignments(self, frame):
+        """ If we have no alignments for this image, skip it """
+        have_alignments = self.alignments.frame_exists(frame)
+        if not have_alignments:
+            tqdm.write("No alignment found for {}, "
+                       "skipping".format(frame))
+        return have_alignments
+
+    def convert(self, converter, item):
+        """ Apply the conversion transferring faces onto frames """
+        try:
+            filename, image, faces = item
+            skip = self.opts.check_skipframe(filename)
+
+            if not skip:
+                for face in faces:
+                    image = self.convert_one_face(converter, image, face)
+                filename = str(self.output_dir / Path(filename).name)
+                cv2.imwrite(filename, image)  # pylint: disable=no-member
+        except Exception as err:
+            logger.error("Failed to convert image: '%s'. Reason: %s", filename, err)
+            raise
+
+    def convert_one_face(self, converter, image, face):
+        """ Perform the conversion on the given frame for a single face """
+        # TODO: This switch between 64 and 128 is a hack for now.
+        # We should have a separate cli option for size
+        size = 128 if (self.args.trainer.strip().lower()
+                       in ('gan128', 'originalhighres')) else 64
+
+        image = converter.patch_image(image,
+                                      face,
+                                      size)
+        return image
+
+
+class OptionalActions():
+    """ Process the optional actions for convert """
+
+    def __init__(self, args, input_images, alignments):
+        logger.debug("Initializing %s", self.__class__.__name__)
+        self.args = args
+        self.input_images = input_images
+        self.alignments = alignments
+        self.frame_ranges = self.get_frame_ranges()
+        self.imageidxre = re.compile(r"[^(mp4)](\d+)(?!.*\d)")
+
+        self.remove_skipped_faces()
+        logger.debug("Initialized %s", self.__class__.__name__)
+
+    # SKIP FACES #
+    def remove_skipped_faces(self):
+        """ Remove deleted faces from the loaded alignments """
+        logger.debug("Filtering Faces")
+        face_hashes = self.get_face_hashes()
+        if not face_hashes:
+            logger.debug("No face hashes. Not skipping any faces")
+            return
+        pre_face_count = self.alignments.faces_count
+        self.alignments.filter_hashes(face_hashes, filter_out=False)
+        logger.info("Faces filtered out: %s", pre_face_count - self.alignments.faces_count)
+
+    def get_face_hashes(self):
+        """ Check for the existence of an aligned directory for identifying
+            which faces in the target frames should be swapped.
+            If it exists, obtain the hashes of the faces in the folder """
+        face_hashes = list()
+        input_aligned_dir = self.args.input_aligned_dir
+
+        if input_aligned_dir is None:
+            logger.verbose("Aligned directory not specified. All faces listed in the "
+                           "alignments file will be converted")
+        elif not os.path.isdir(input_aligned_dir):
+            logger.warning("Aligned directory not found. All faces listed in the "
+                           "alignments file will be converted")
+        else:
+            file_list = [path for path in get_image_paths(input_aligned_dir)]
+            logger.info("Getting Face Hashes for selected Aligned Images")
+            for face in tqdm(file_list, desc="Hashing Faces"):
+                face_hashes.append(hash_image_file(face))
+            logger.debug("Face Hashes: %s", (len(face_hashes)))
+            if not face_hashes:
+                logger.error("Aligned directory is empty, no faces will be converted!")
+                exit(1)
+            elif len(face_hashes) <= len(self.input_images) / 3:
+                logger.warning("Aligned directory contains far fewer images than the input "
+                               "directory, are you sure this is the right folder?")
+        return face_hashes
+
+    # SKIP FRAME RANGES #
+    def get_frame_ranges(self):
+        """ split out the frame ranges and parse out 'min' and 'max' values """
+        if not self.args.frame_ranges:
+            return None
+
+        minmax = {"min": 0,  # never any frames less than 0
+                  "max": float("inf")}
+        rng = [tuple(map(lambda q: minmax[q] if q in minmax.keys() else int(q),
+                         v.split("-")))
+               for v in self.args.frame_ranges]
+        return rng
+
+    def check_skipframe(self, filename):
+        """ Check whether frame is to be skipped """
+        if not self.frame_ranges:
+            return None
+        idx = int(self.imageidxre.findall(filename)[0])
+        skipframe = not any(map(lambda b: b[0] <= idx <= b[1],
+                                self.frame_ranges))
+        if skipframe and self.args.discard_frames:
+            skipframe = "discard"
+        return skipframe
+
+
+class Legacy():
+    """ Update legacy alignments:
+
+        - Add frame dimensions
+        - Rotate landmarks and bounding boxes on legacy alignments
+        and remove the 'r' parameter
+        - Add face hashes to alignments file
+        """
+    def __init__(self, alignments, frames, faces_dir):
+        self.alignments = alignments
+        self.frames = {os.path.basename(frame): frame
+                       for frame in frames}
+        self.process(faces_dir)
+
+    def process(self, faces_dir):
+        """ Run the rotate alignments process """
+        no_dims = self.alignments.get_legacy_no_dims()
+        rotated = self.alignments.get_legacy_rotation()
+        hashes = self.alignments.get_legacy_no_hashes()
+        if not no_dims and not rotated and not hashes:
+            return
+        if no_dims:
+            logger.info("Legacy landmarks found. Adding frame dimensions...")
+            self.add_dimensions(no_dims)
+            self.alignments.save()
+        if rotated:
+            logger.info("Legacy rotated frames found. Converting...")
+            self.rotate_landmarks(rotated)
+            self.alignments.save()
+        if hashes and faces_dir:
+            logger.info("Legacy alignments found. Adding Face Hashes...")
+            self.add_hashes(hashes, faces_dir)
+            self.alignments.save()
+
+    def add_dimensions(self, no_dims):
+        """ Add width and height of original frame to alignments """
+        for no_dim in tqdm(no_dims, desc="Adding Frame Dimensions"):
+            if no_dim not in self.frames.keys():
+                continue
+            filename = self.frames[no_dim]
+            dims = cv2.imread(filename).shape[:2]  # pylint: disable=no-member
+            self.alignments.add_dimensions(no_dim, dims)
+
+    def rotate_landmarks(self, rotated):
+        """ Rotate the landmarks """
+        for rotate_item in tqdm(rotated, desc="Rotating Landmarks"):
+            if rotate_item not in self.frames.keys():
+                logger.debug("Skipping missing frame: '%s'", rotate_item)
+                continue
+            self.alignments.rotate_existing_landmarks(rotate_item)
+
+    def add_hashes(self, hashes, faces_dir):
+        """ Add Face Hashes to the alignments file """
+        all_faces = dict()
+        face_files = sorted(face for face in os.listdir(faces_dir) if "_" in face)
+        for face in face_files:
+            filename, extension = os.path.splitext(face)
+            index = filename[filename.rfind("_") + 1:]
+            if not index.isdigit():
+                continue
+            orig_frame = filename[:filename.rfind("_")] + extension
+            all_faces.setdefault(orig_frame, dict())[int(index)] = os.path.join(faces_dir, face)
+
+        for frame in tqdm(hashes):
+            if frame not in all_faces.keys():
+                logger.warning("Skipping missing frame: '%s'", frame)
+                continue
+            hash_faces = all_faces[frame]
+            for index, face_path in hash_faces.items():
+                hash_faces[index] = hash_image_file(face_path)
+            self.alignments.add_face_hashes(frame, hash_faces)
